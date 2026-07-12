@@ -6,11 +6,7 @@ import mpmath as mp
 
 
 def load_digits_mod(path: str, ell: int) -> np.ndarray:
-    """
-    Load comma-separated residues from a text file.
-    Assumes residues are single ASCII digits, which is valid for ell in {2,3,5}.
-    Commas/newlines are ignored.
-    """
+   
     if ell not in (2, 3, 5):
         raise ValueError("This script is intended for ell in {2,3,5}.")
 
@@ -33,7 +29,6 @@ def load_digits_mod(path: str, ell: int) -> np.ndarray:
 
 
 def blocks_to_indices(digits: np.ndarray, m: int, ell: int) -> np.ndarray:
-    """Encode non-overlapping length-m blocks as base-ell integers."""
     L = (len(digits) // m) * m
     if L == 0:
         raise ValueError(f"The sequence is too short to form blocks of length m={m}.")
@@ -58,10 +53,7 @@ def chi2_uniform_test(digits: np.ndarray, ell: int, m: int):
     }
 
 def missing_word_test(digits: np.ndarray, ell: int, m: int):
-    """
-    Missing-word statistic with high-precision occupancy
-    expectation and variance.
-    """
+
     M = ell ** m
 
     if M > np.iinfo(np.int64).max:
