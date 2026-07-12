@@ -2,6 +2,7 @@ import argparse
 import math
 import mmap
 import numpy as np
+import mpmath as mp
 
 
 def load_digits_mod(path: str, ell: int) -> np.ndarray:
@@ -56,31 +57,75 @@ def chi2_uniform_test(digits: np.ndarray, ell: int, m: int):
         "p_value": float(chi2_dist.sf(chi2_stat, df)),
     }
 
-
 def missing_word_test(digits: np.ndarray, ell: int, m: int):
-    """Missing-word statistic with exact occupancy expectation/variance."""
-    idx = blocks_to_indices(digits, m, ell)
+    """
+    Missing-word statistic with high-precision occupancy
+    expectation and variance.
+    """
     M = ell ** m
-    counts = np.bincount(idx, minlength=M)
-    B = int(counts.sum())
-    obs_zeros = int(np.count_nonzero(counts == 0))
+
+    if M > np.iinfo(np.int64).max:
+        raise ValueError("Pattern space too large for int64 encoding.")
+
+    L = (len(digits) // m) * m
+    if L == 0:
+        raise ValueError(
+            f"The sequence is too short to form blocks of length m={m}."
+        )
+
+    B = L // m
+    blocks = digits[:L].reshape(B, m)
+
+    idx = np.zeros(B, dtype=np.int64)
+    for j in range(m):
+        idx = idx * ell + blocks[:, j].astype(np.int64)
+
+    distinct = int(np.unique(idx).size)
+    obs_zeros = int(M - distinct)
     lam = B / M
 
-    q1 = (1.0 - 1.0 / M) ** B
-    q2 = (1.0 - 2.0 / M) ** B if M > 1 else 0.0
-    exp_zeros = M * q1
-    var_zeros = M * q1 * (1.0 - q1) + M * (M - 1) * (q2 - q1 * q1)
-    if var_zeros < 0 and abs(var_zeros) < 1e-7:
-        var_zeros = 0.0
-    z = (obs_zeros - exp_zeros) / math.sqrt(var_zeros) if var_zeros > 0 else float("nan")
+    with mp.workdps(80):
+        M_mp = mp.mpf(M)
+        B_mp = mp.mpf(B)
+
+        log_q1 = B_mp * mp.log1p(-1 / M_mp)
+        log_q2 = B_mp * mp.log1p(-2 / M_mp)
+
+        q1_mp = mp.exp(log_q1)
+        exp_zeros_mp = M_mp * q1_mp
+
+        q2_minus_q1_sq = (
+            q1_mp ** 2
+            * mp.expm1(log_q2 - 2 * log_q1)
+        )
+
+        var_zeros_mp = (
+            M_mp * q1_mp * (1 - q1_mp)
+            + M_mp * (M_mp - 1) * q2_minus_q1_sq
+        )
+
+        if var_zeros_mp > 0:
+            z_mp = (
+                mp.mpf(obs_zeros) - exp_zeros_mp
+            ) / mp.sqrt(var_zeros_mp)
+        else:
+            z_mp = mp.nan
+
+        exp_zeros = float(exp_zeros_mp)
+        var_zeros = float(var_zeros_mp)
+        z = float(z_mp)
 
     return {
-        "ell": ell, "m": m, "blocks": B, "pattern_space": int(M),
-        "lambda": float(lam), "obs_zeros": obs_zeros,
-        "exp_zeros": float(exp_zeros), "var_zeros": float(var_zeros),
-        "z_score": float(z),
-    }
-
+        "ell": ell,
+        "m": m,
+        "blocks": B,
+        "pattern_space": int(M),
+        "lambda": float(lam),
+        "obs_zeros": obs_zeros,
+        "exp_zeros": exp_zeros,
+        "var_zeros": var_zeros,
+        "z_score": z,
+    }   
 
 def make_control_sequence(control: str, length: int, ell: int, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
@@ -228,12 +273,18 @@ def run_c2st(digits, ell, m, samples, model_name, epochs, batch_size, lr, seed, 
 
 
 def default_chi2_m_list(ell: int):
-    return {2: [1, 5, 10, 14, 17], 3: [1, 5, 8, 11], 5: list(range(1, 9))}[ell]
-
+    return {
+        2: list(range(1, 20)),  # m = 1, ..., 19
+        3: list(range(1, 13)),  # m = 1, ..., 12
+        5: list(range(1, 10)),  # m = 1, ..., 9
+    }[ell]
 
 def default_missing_m_list(ell: int):
-    return {2: [18, 20, 22, 24, 25], 3: [12, 13, 14, 15, 16], 5: [9, 10, 11]}[ell]
-
+    return {
+        2: list(range(20, 42)),  # m = 20, ..., 41
+        3: list(range(13, 27)),  # m = 13, ..., 26
+        5: list(range(10, 19)),  # m = 10, ..., 18
+    }[ell]
 
 def default_c2st_m_list(ell: int):
     return {2: [50], 3: [32], 5: [22]}[ell]
@@ -283,6 +334,8 @@ def main():
                   f"lambda={r['lambda']:.6f} zeros(obs)={r['obs_zeros']:,} zeros(exp)={r['exp_zeros']:.3f} Z={r['z_score']:.6f}")
 
     elif args.cmd == "c2st":
+
+        
         m_list = args.m_list if args.m_list is not None else default_c2st_m_list(ell)
         controls = args.controls if args.controls is not None else ["target"]
         for m in m_list:
