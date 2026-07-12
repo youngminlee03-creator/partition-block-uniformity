@@ -5,7 +5,6 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using u128 = unsigned __int128;
 
-// NTT prime: 3 * 2^30 + 1. Supports power-of-two NTT length up to 2^30.
 static constexpr u32 MOD = 3221225473u;
 static constexpr u32 G   = 5u;
 
@@ -64,9 +63,6 @@ static void ntt(vector<u32>& a, bool invert) {
     }
 }
 
-// Convolution over ordinary integers, then reduce modulo ell.
-// This single-NTT version is safe for ell in {2,3,5} and N <= 1e8 because
-// every coefficient is bounded by (ell-1)^2 * (#summands) <= 16 * 1e8 < MOD.
 static vector<uint8_t> convolve_mod_ell(const uint8_t* A, int nA,
                                         const uint8_t* B, int nB,
                                         int need, int ell)
@@ -134,8 +130,6 @@ struct StreamWriter {
     void finish() { flush(); }
 };
 
-// Invert power series a[0..n-1] over F_ell, with a[0]=1.
-// Newton iteration: b <- b * (2 - a*b) mod x^(2m).
 static vector<uint8_t> inverse_series_mod_ell_stream(
     const vector<uint8_t>& a, int n, int ell,
     const function<void(const vector<uint8_t>&, int)>& on_stage
@@ -202,8 +196,6 @@ int main(int argc, char** argv) {
         outPath = "pmod" + to_string(ell) + ".txt";
     }
 
-    // Build A(q)=prod_{k>=1}(1-q^k) modulo ell up to q^N using Euler's pentagonal theorem:
-    // A(q)=sum_{k=-inf}^{inf} (-1)^k q^{k(3k-1)/2}.
     vector<uint8_t> A(N + 1, 0);
     A[0] = 1;
     for (long long k = 1;; k++) {
