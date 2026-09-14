@@ -1,0 +1,398 @@
+import argparse
+import math
+import mmap
+import numpy as np
+import mpmath as mp
+
+
+def load_digits_mod(path: str, ell: int) -> np.ndarray:
+   
+    if ell not in (2, 3, 5):
+        raise ValueError("This script is intended for ell in {2,3,5}.")
+
+    lo = ord("0")
+    hi = ord("0") + ell - 1
+
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            buf = np.frombuffer(mm, dtype=np.uint8)
+            mask = (buf >= lo) & (buf <= hi)
+            digits = (buf[mask] - lo).astype(np.uint8)
+        finally:
+            try:
+                del buf
+            except UnboundLocalError:
+                pass
+            mm.close()
+    return digits
+
+
+def blocks_to_indices(digits: np.ndarray, m: int, ell: int) -> np.ndarray:
+    L = (len(digits) // m) * m
+    if L == 0:
+        raise ValueError(f"The sequence is too short to form blocks of length m={m}.")
+    blocks = digits[:L].reshape(-1, m).astype(np.int64, copy=False)
+    pows = ell ** np.arange(m - 1, -1, -1, dtype=np.int64)
+    return blocks @ pows
+
+
+def chi2_uniform_test(digits: np.ndarray, ell: int, m: int):
+    from scipy.stats import chi2 as chi2_dist
+    idx = blocks_to_indices(digits, m, ell)
+    M = ell ** m
+    counts = np.bincount(idx, minlength=M).astype(np.float64)
+    B = counts.sum()
+    lam = B / M
+    chi2_stat = np.sum((counts - lam) ** 2 / lam)
+    df = M - 1
+    return {
+        "ell": ell, "m": m, "blocks": int(B), "pattern_space": int(M),
+        "lambda": float(lam), "chi2": float(chi2_stat), "df": int(df),
+        "p_value": float(chi2_dist.sf(chi2_stat, df)),
+    }
+
+def missing_word_test(digits: np.ndarray, ell: int, m: int):
+
+    M = ell ** m
+
+    if M > np.iinfo(np.int64).max:
+        raise ValueError("Pattern space too large for int64 encoding.")
+
+    L = (len(digits) // m) * m
+    if L == 0:
+        raise ValueError(
+            f"The sequence is too short to form blocks of length m={m}."
+        )
+
+    B = L // m
+    blocks = digits[:L].reshape(B, m)
+
+    idx = np.zeros(B, dtype=np.int64)
+    for j in range(m):
+        idx = idx * ell + blocks[:, j].astype(np.int64)
+
+    distinct = int(np.unique(idx).size)
+    obs_zeros = int(M - distinct)
+    lam = B / M
+
+    with mp.workdps(80):
+        M_mp = mp.mpf(M)
+        B_mp = mp.mpf(B)
+
+        log_q1 = B_mp * mp.log1p(-1 / M_mp)
+        log_q2 = B_mp * mp.log1p(-2 / M_mp)
+
+        q1_mp = mp.exp(log_q1)
+        exp_zeros_mp = M_mp * q1_mp
+
+        q2_minus_q1_sq = (
+            q1_mp ** 2
+            * mp.expm1(log_q2 - 2 * log_q1)
+        )
+
+        var_zeros_mp = (
+            M_mp * q1_mp * (1 - q1_mp)
+            + M_mp * (M_mp - 1) * q2_minus_q1_sq
+        )
+
+        if var_zeros_mp > 0:
+            z_mp = (
+                mp.mpf(obs_zeros) - exp_zeros_mp
+            ) / mp.sqrt(var_zeros_mp)
+        else:
+            z_mp = mp.nan
+
+        exp_zeros = float(exp_zeros_mp)
+        var_zeros = float(var_zeros_mp)
+        z = float(z_mp)
+
+    return {
+        "ell": ell,
+        "m": m,
+        "blocks": B,
+        "pattern_space": int(M),
+        "lambda": float(lam),
+        "obs_zeros": obs_zeros,
+        "exp_zeros": exp_zeros,
+        "var_zeros": var_zeros,
+        "z_score": z,
+    }   
+
+def make_control_sequence(control: str, length: int, ell: int, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    if control == "periodic":
+        return (np.arange(length, dtype=np.int64) % ell).astype(np.uint8)
+    if control == "biased":
+        p0 = 1.0 / ell + 0.01
+        prest = (1.0 - p0) / (ell - 1)
+        probs = np.array([p0] + [prest] * (ell - 1), dtype=np.float64)
+        return rng.choice(ell, size=length, p=probs).astype(np.uint8)
+    if control in ("digit_sum", "thue_morse", "thue_morse_type"):
+        lut = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+        out = np.empty(length, dtype=np.uint8)
+        chunk = 2_000_000
+        for start in range(0, length, chunk):
+            end = min(start + chunk, length)
+            n = np.arange(start, end, dtype=np.uint64)
+            b = n.view(np.uint8).reshape(-1, 8)
+            pc = lut[b].sum(axis=1, dtype=np.uint16)
+            out[start:end] = (pc % ell).astype(np.uint8)
+        return out
+    raise ValueError("control must be one of: periodic, biased, digit_sum")
+
+
+def sample_blocks_for_c2st(digits: np.ndarray, m: int, samples: int, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    L = (len(digits) // m) * m
+    blocks = digits[:L].reshape(-1, m)
+    nblocks = blocks.shape[0]
+    samples = min(samples, nblocks)
+    idx = rng.choice(nblocks, size=samples, replace=False)
+    return blocks[idx].copy()
+
+
+def run_c2st(digits, ell, m, samples, model_name, epochs, batch_size, lr, seed, control=None):
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from sklearn.metrics import roc_auc_score, accuracy_score
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    if control is None:
+        X_real = sample_blocks_for_c2st(digits, m, samples, seed=seed)
+    else:
+        ctrl = make_control_sequence(control, length=len(digits), ell=ell, seed=seed)
+        X_real = sample_blocks_for_c2st(ctrl, m, samples, seed=seed)
+
+    X_fake = np.random.randint(0, ell, size=(X_real.shape[0], m), dtype=np.uint8)
+    y_real = np.ones((X_real.shape[0],), dtype=np.int64)
+    y_fake = np.zeros((X_fake.shape[0],), dtype=np.int64)
+
+    X = np.concatenate([X_real, X_fake], axis=0)
+    y = np.concatenate([y_real, y_fake], axis=0)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(y))
+    X, y = X[perm], y[perm]
+
+    n = len(y)
+    n_train = int(n * 0.8)
+    X_train, X_test = X[:n_train], X[n_train:]
+    y_train, y_test = y[:n_train], y[n_train:]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X_train_t = torch.tensor(X_train, dtype=torch.long)
+    y_train_t = torch.tensor(y_train, dtype=torch.long)
+    X_test_t = torch.tensor(X_test, dtype=torch.long)
+    y_test_t = torch.tensor(y_test, dtype=torch.long)
+
+    train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=batch_size, shuffle=False)
+
+    class DilatedCNN(nn.Module):
+        def __init__(self, m, vocab, emb=16, channels=64):
+            super().__init__()
+            self.emb = nn.Embedding(vocab, emb)
+            self.convs = nn.ModuleList([
+                nn.Conv1d(emb, channels, kernel_size=3, padding=1, dilation=1),
+                nn.Conv1d(channels, channels, kernel_size=3, padding=2, dilation=2),
+                nn.Conv1d(channels, channels, kernel_size=3, padding=4, dilation=4),
+                nn.Conv1d(channels, channels, kernel_size=3, padding=8, dilation=8),
+                nn.Conv1d(channels, channels, kernel_size=3, padding=16, dilation=16),
+            ])
+            self.act = nn.ReLU()
+            self.head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(channels, 2))
+        def forward(self, x):
+            x = self.emb(x).transpose(1, 2)
+            for conv in self.convs:
+                x = self.act(conv(x))
+            return self.head(x)
+
+    class SmallTransformer(nn.Module):
+        """Order-preserving, two-symbol patch Transformer for block C2ST.
+
+        Each ordered pair is one categorical token. A reserved padding symbol
+        handles odd block lengths without discarding the final symbol.
+        No control-sequence formula, labels, or absolute sequence indices are used.
+        """
+
+        def __init__(self, m, vocab, d_model=32, nhead=4, num_layers=2):
+            super().__init__()
+            if m < 1 or vocab < 2:
+                raise ValueError("m must be positive and vocab must be at least 2.")
+            if d_model < 1 or nhead < 1 or d_model % nhead != 0:
+                raise ValueError("d_model must be positive and divisible by nhead.")
+            if num_layers < 1:
+                raise ValueError("num_layers must be positive.")
+
+            self.max_length = m
+            self.pad_symbol = vocab
+            self.base = vocab + 1
+            self.emb = nn.Embedding(self.base ** 2, d_model)
+
+            # Fixed, nonzero positional information from the first training step.
+            n_patches = (m + 1) // 2
+            position = torch.arange(n_patches, dtype=torch.float32).unsqueeze(1)
+            frequency = torch.exp(
+                torch.arange(0, d_model, 2, dtype=torch.float32)
+                * (-math.log(10000.0) / d_model)
+            )
+            pe = torch.zeros(n_patches, d_model)
+            pe[:, 0::2] = torch.sin(position * frequency)
+            pe[:, 1::2] = torch.cos(position * frequency[:d_model // 2])
+            self.register_buffer("pos", pe.unsqueeze(0))
+
+            # Construct layers separately rather than cloning one initialization.
+            # Width, head count, layer count, FFN width and dropout are unchanged.
+            self.enc = nn.ModuleList([
+                nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=128,
+                    dropout=0.1,
+                    activation="relu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(num_layers)
+            ])
+            self.norm = nn.LayerNorm(d_model)
+            self.cls = nn.Linear(d_model, 2)
+
+        def forward(self, x):
+            if x.ndim != 2 or not 1 <= x.size(1) <= self.max_length:
+                raise ValueError("Expected input shape (batch, length), 1 <= length <= m.")
+
+            # This injective encoding distinguishes (a,b) from (b,a) for a != b.
+            # Padding is an extra symbol, never one of the observed residues.
+            if x.size(1) % 2:
+                padding = x.new_full((x.size(0), 1), self.pad_symbol)
+                x = torch.cat((x, padding), dim=1)
+            pair_ids = self.base * x[:, 0::2] + x[:, 1::2]
+
+            h = self.emb(pair_ids)
+            h = h + self.pos[:, :h.size(1), :].to(dtype=h.dtype)
+            for layer in self.enc:
+                h = layer(h)
+            return self.cls(self.norm(h).mean(dim=1))
+
+    if model_name == "cnn":
+        model = DilatedCNN(m=m, vocab=ell).to(device)
+    elif model_name == "transformer":
+        model = SmallTransformer(m=m, vocab=ell).to(device)
+    else:
+        raise ValueError("model must be 'cnn' or 'transformer'")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    model.train()
+    for ep in range(1, epochs + 1):
+        total = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad(set_to_none=True)
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            opt.step()
+            total += float(loss.item()) * xb.size(0)
+        print(f"[ell={ell}, m={m}] epoch {ep}/{epochs} train_loss={total / n_train:.6f}")
+
+    model.eval()
+    probs, ys = [], []
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(device)
+            p1 = torch.softmax(model(xb), dim=1)[:, 1].detach().cpu().numpy()
+            probs.append(p1)
+            ys.append(yb.numpy())
+    probs = np.concatenate(probs)
+    ys = np.concatenate(ys)
+    pred = (probs >= 0.5).astype(np.int64)
+
+    return {
+        "ell": ell, "m": m, "samples_each": int(X_real.shape[0]),
+        "model": model_name, "auc": float(roc_auc_score(ys, probs)),
+        "accuracy": float(accuracy_score(ys, pred)), "control": control,
+    }
+
+
+def default_chi2_m_list(ell: int):
+    return {
+        2: list(range(1, 20)),  # m = 1, ..., 19
+        3: list(range(1, 13)),  # m = 1, ..., 12
+        5: list(range(1, 10)),  # m = 1, ..., 9
+    }[ell]
+
+def default_missing_m_list(ell: int):
+    return {
+        2: list(range(20, 42)),  # m = 20, ..., 41
+        3: list(range(13, 27)),  # m = 13, ..., 26
+        5: list(range(10, 19)),  # m = 10, ..., 18
+    }[ell]
+
+def default_c2st_m_list(ell: int):
+    return {2: [50], 3: [32], 5: [22]}[ell]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ell", type=int, required=True, choices=[2, 3, 5], help="modulus ell")
+    ap.add_argument("--data", required=True, help="path to pmod{ell}.txt")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    ap1 = sub.add_parser("chi2", help="Dense regime: Pearson chi-square test")
+    ap1.add_argument("--m-list", type=int, nargs="+", default=None)
+
+    ap2 = sub.add_parser("missing", help="Intermediate regime: missing-word statistic")
+    ap2.add_argument("--m-list", type=int, nargs="+", default=None)
+
+    ap3 = sub.add_parser("c2st", help="Sparse regime: classifier two-sample test")
+    ap3.add_argument("--m-list", type=int, nargs="+", default=None)
+    ap3.add_argument("--samples", type=int, default=1_000_000, help="samples per class")
+    ap3.add_argument("--model", choices=["cnn", "transformer"], default="cnn")
+    ap3.add_argument("--epochs", type=int, default=2)
+    ap3.add_argument("--batch-size", type=int, default=4096)
+    ap3.add_argument("--lr", type=float, default=2e-3)
+    ap3.add_argument("--seed", type=int, default=0)
+    ap3.add_argument("--controls", nargs="+", default=None, choices=["target", "periodic", "biased", "digit_sum"])
+
+    args = ap.parse_args()
+    ell = args.ell
+    print(f"Loading digits from: {args.data}")
+    print(f"ell = {ell}")
+    digits = load_digits_mod(args.data, ell)
+    print("digits length:", len(digits))
+
+    if args.cmd == "chi2":
+        m_list = args.m_list if args.m_list is not None else default_chi2_m_list(ell)
+        for m in m_list:
+            r = chi2_uniform_test(digits, ell, m)
+            print(f"[CHI2] ell={r['ell']} m={r['m']} blocks={r['blocks']:,} M={ell}^{m}={r['pattern_space']:,} "
+                  f"lambda={r['lambda']:.6f} chi2={r['chi2']:.6f} df={r['df']:,} p={r['p_value']:.8g}")
+
+    elif args.cmd == "missing":
+        m_list = args.m_list if args.m_list is not None else default_missing_m_list(ell)
+        for m in m_list:
+            r = missing_word_test(digits, ell, m)
+            print(f"[MISSING] ell={r['ell']} m={r['m']} blocks={r['blocks']:,} M={ell}^{m}={r['pattern_space']:,} "
+                  f"lambda={r['lambda']:.6f} zeros(obs)={r['obs_zeros']:,} zeros(exp)={r['exp_zeros']:.3f} Z={r['z_score']:.6f}")
+
+    elif args.cmd == "c2st":
+
+        
+        m_list = args.m_list if args.m_list is not None else default_c2st_m_list(ell)
+        controls = args.controls if args.controls is not None else ["target"]
+        for m in m_list:
+            for c in controls:
+                control_arg = None if c == "target" else c
+                r = run_c2st(digits, ell, m, args.samples, args.model, args.epochs, args.batch_size, args.lr, args.seed, control_arg)
+                tag = f"control={r['control']}" if r["control"] else f"target=p(n) mod {ell}"
+                print(f"[C2ST] ell={r['ell']} m={r['m']} {tag} model={r['model']} samples_each={r['samples_each']:,} "
+                      f"AUC={r['auc']:.6f} ACC={r['accuracy']:.6f}")
+
+
+if __name__ == "__main__":
+    main()
